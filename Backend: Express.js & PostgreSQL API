@@ -1,0 +1,197 @@
+/*
+-- backend/server.js --
+This file sets up the entire Express.js backend.
+In a larger project, you would split routes, controllers, and db logic into separate files/folders.
+*/
+
+// --- DEPENDENCIES ---
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
+
+// --- APP & MIDDLEWARE SETUP ---
+const app = express();
+app.use(cors()); // Enable Cross-Origin Resource Sharing
+app.use(express.json()); // Parse JSON request bodies
+
+// --- DATABASE CONNECTION ---
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+// --- AUTHENTICATION MIDDLEWARE ---
+// This middleware verifies the JWT and attaches the user's ID to the request object.
+const authMiddleware = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer <TOKEN>
+
+  if (!token) {
+    return res.status(401).json({ message: 'Access denied. No token provided.' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = decoded.userId; // Add userId to request object
+    next();
+  } catch (error) {
+    res.status(403).json({ message: 'Invalid or expired token.' });
+  }
+};
+
+
+// --- API ROUTES ---
+
+// 1. AUTHENTICATION ROUTES
+// POST /api/auth/register - Create a new user
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: 'Name, email, and password are required.' });
+  }
+
+  try {
+    // Hash the password before storing it
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const newUser = await pool.query(
+      'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id, name, email',
+      [name, email, hashedPassword]
+    );
+
+    res.status(201).json(newUser.rows[0]);
+  } catch (error) {
+    // Handle potential duplicate email error
+    if (error.code === '23505') {
+      return res.status(409).json({ message: 'Email already in use.' });
+    
+    console.error(error);
+    res.status(500).json({ message: 'Server error during registration.' });
+  }
+});
+
+// POST /api/auth/login - Log a user in
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email and password are required.' });
+  }
+
+  try {
+    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (userResult.rows.length === 0) {
+      return res.status(401).json({ message: 'Invalid credentials.' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Compare submitted password with the hashed password in the database
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Invalid credentials.' });
+    }
+
+    // Create and sign a JWT
+    const token = jwt.sign(
+      { userId: user.id },
+      process.env.JWT_SECRET,
+      { expiresIn: '1d' } // Token expires in 1 day
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error during login.' });
+  }
+});
+
+
+// 2. USER PROFILE & LISTS ROUTES (PROTECTED)
+// GET /api/users/profile - Get user's profile including their movie lists
+app.get('/api/users/profile', authMiddleware, async (req, res) => {
+  try {
+    // Fetch user details
+    const userResult = await pool.query('SELECT id, name, email FROM users WHERE id = $1', [req.userId]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+    const user = userResult.rows[0];
+
+    // Fetch user's movie lists
+    const moviesResult = await pool.query('SELECT * FROM user_movies WHERE user_id = $1', [req.userId]);
+    
+    // Separate movies into favorites and watchlist
+    const favorites = moviesResult.rows.filter(m => m.list_type === 'favorite');
+    const watchlist = moviesResult.rows.filter(m => m.list_type === 'watchlist');
+
+    res.json({ ...user, favorites, watchlist });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error fetching profile.' });
+  }
+});
+
+// POST /api/movies - Add a movie to a user's list (favorite or watchlist)
+app.post('/api/movies', authMiddleware, async (req, res) => {
+    const { movieId, title, posterPath, listType } = req.body;
+
+    if (!movieId || !listType || !title) {
+        return res.status(400).json({ message: 'movieId, title, and listType are required.' });
+    }
+    if (listType !== 'favorite' && listType !== 'watchlist') {
+        return res.status(400).json({ message: "listType must be 'favorite' or 'watchlist'." });
+    }
+
+    try {
+        // Use an "UPSERT" to avoid duplicates: Insert or update if exists.
+        const result = await pool.query(
+            `INSERT INTO user_movies (user_id, movie_id, title, poster_path, list_type)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (user_id, movie_id) DO UPDATE SET list_type = EXCLUDED.list_type
+             RETURNING *`,
+            [req.userId, movieId, title, posterPath, listType]
+        );
+        res.status(201).json(result.rows[0]);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error adding movie.' });
+    }
+});
+
+// DELETE /api/movies/:movieId - Remove a movie from a user's lists
+app.delete('/api/movies/:movieId', authMiddleware, async (req, res) => {
+    const { movieId } = req.params;
+    try {
+        const result = await pool.query(
+            'DELETE FROM user_movies WHERE user_id = $1 AND movie_id = $2',
+            [req.userId, movieId]
+        );
+
+        if (result.rowCount === 0) {
+            return res.status(404).json({ message: 'Movie not found in user lists.' });
+        }
+        res.status(200).json({ message: 'Movie removed successfully.' });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Server error removing movie.' });
+    }
+});
+
+
+// --- SERVER START ---
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Backend server is running on http://localhost:${PORT}`);
+});
