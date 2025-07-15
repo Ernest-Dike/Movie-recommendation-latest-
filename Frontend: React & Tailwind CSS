@@ -374,4 +374,7 @@ export default function App() {
             ) : (<button onClick={() => navigateTo('auth')} className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-md transition-colors duration-300">Login</button>)}
           </div>
         </nav>
-      <
+     </header>
+ <main className="container mx-auto p-6">{renderPage()}</main>
+</div>
+
